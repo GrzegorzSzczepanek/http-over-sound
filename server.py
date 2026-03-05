@@ -169,10 +169,11 @@ def setup_default_routes(router: SoundRouter):
 
 class SoundHTTPServer:
 
-    def __init__(self, router: SoundRouter | None = None):
+    def __init__(self, router: SoundRouter | None = None, debug: bool = False):
         self.router = router or SoundRouter()
         self.running = False
         self.request_count = 0
+        self.debug = debug
 
     def log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -286,6 +287,12 @@ class SoundHTTPServer:
         COOLDOWN = 3.0
         energy_history = []
         ENERGY_WINDOW = 20
+        RMS_THRESHOLD = 0.003       # próg energii chunka (był 0.008)
+        AVG_THRESHOLD = 0.004       # próg średniej energii (był 0.01)
+        debug_counter = 0
+
+        if self.debug:
+            self.log(f"[debug] Progi: RMS>{RMS_THRESHOLD}, AVG>{AVG_THRESHOLD}")
 
         try:
             while self.running:
@@ -308,7 +315,15 @@ class SoundHTTPServer:
                 if len(energy_history) > ENERGY_WINDOW:
                     energy_history.pop(0)
 
-                if rms < 0.008:
+                # Debug: pokaż poziom energii co sekundę
+                debug_counter += 1
+                if self.debug and debug_counter % 20 == 0:
+                    avg_e = np.mean(energy_history)
+                    peak = np.max(np.abs(chunk))
+                    bar = '#' * min(50, int(rms * 500))
+                    print(f"\r  [mic] rms={rms:.4f} avg={avg_e:.4f} peak={peak:.3f} |{bar:<50}|", end="", flush=True)
+
+                if rms < RMS_THRESHOLD:
                     continue
 
                 now = time.time()
@@ -316,8 +331,13 @@ class SoundHTTPServer:
                     continue
 
                 avg_energy = np.mean(energy_history)
-                if avg_energy < 0.01:
+                if avg_energy < AVG_THRESHOLD:
+                    if self.debug:
+                        self.log(f"[debug] RMS ok ({rms:.4f}) ale avg za niska ({avg_energy:.4f})")
                     continue
+
+                if self.debug:
+                    self.log(f"[debug] Energia OK! rms={rms:.4f} avg={avg_energy:.4f} — szukam preambuly...")
 
                 # Zbierz ostatnie sekundy z ring buffera
                 lookback = int(sr * 8)
@@ -332,6 +352,8 @@ class SoundHTTPServer:
                 # Szukaj preambuły
                 preamble_pos = find_preamble(segment, sr)
                 if preamble_pos is None:
+                    if self.debug:
+                        self.log("[debug] Preambula NIE znaleziona w segmencie")
                     continue
 
                 last_request_time = now
@@ -419,6 +441,8 @@ Przyklad:
                         help="Sample rate (domyslnie: 44100)")
     parser.add_argument("--list-devices", action="store_true",
                         help="Pokaz urzadzenia audio")
+    parser.add_argument("--debug", action="store_true",
+                        help="Wyswietlaj diagnostyke (poziom mikrofonu, detekcja)")
 
     args = parser.parse_args()
 
@@ -428,7 +452,7 @@ Przyklad:
 
     router = SoundRouter()
     setup_default_routes(router)
-    server = SoundHTTPServer(router)
+    server = SoundHTTPServer(router, debug=getattr(args, 'debug', False))
 
     if args.simulate:
         server.serve_simulate(args.simulate, args.response_wav)
