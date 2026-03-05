@@ -164,8 +164,10 @@ def encode_packet_audio(packet: dict, sr: int = SAMPLE_RATE) -> np.ndarray:
     return _nibbles_to_audio(nibbles, sr)
 
 
-def decode_packet_from_audio(audio: np.ndarray, sr: int = SAMPLE_RATE) -> dict | None:
-    """Dekoduj pakiet z audio FSK."""
+def decode_packet_from_audio(audio: np.ndarray, sr: int = SAMPLE_RATE,
+                             strict: bool = True) -> dict | None:
+    """Dekoduj pakiet z audio FSK.
+    strict=False: akceptuj pakiety nawet z błędnym CRC / payload_len."""
     _, _, step = calc_steps(sr)
 
     preamble_off = find_preamble(audio, sr)
@@ -190,7 +192,10 @@ def decode_packet_from_audio(audio: np.ndarray, sr: int = SAMPLE_RATE) -> dict |
     pos += 2 * step
 
     if payload_len > 128:  # sanity check
-        return None
+        if strict:
+            return None
+        print(f"  [lenient] payload_len={payload_len} > 128, obcinam do 128")
+        payload_len = min(payload_len, 128)
 
     # DATA
     payload = b''
@@ -243,12 +248,14 @@ class LiveSession:
       - Odbiór z weryfikacją CRC i żądaniem retransmisji
     """
 
-    def __init__(self, pa, sr: int, mic_index, speaker_index, log_fn=None):
+    def __init__(self, pa, sr: int, mic_index, speaker_index,
+                 log_fn=None, strict: bool = True):
         self.pa = pa
         self.sr = sr
         self.mic_index = mic_index
         self.speaker_index = speaker_index
         self.log = log_fn or (lambda msg: print(f"  [pkt] {msg}"))
+        self.strict = strict
 
     # ── Audio I/O ──
 
@@ -372,6 +379,7 @@ class LiveSession:
         Odbierz pakiety z ACK/NAK i retransmisją.
         first_audio: audio pierwszego pakietu (jeśli już nagrane przez serwer).
         Zwraca złożone dane lub None.
+        W trybie lenient (strict=False): akceptuje pakiety z CRC FAIL.
         """
         received = []
         expected_seq = 0
@@ -389,10 +397,10 @@ class LiveSession:
                     return self._try_reassemble(received)
 
             # ── Dekoduj pakiet ──
-            pkt = decode_packet_from_audio(audio, self.sr)
+            pkt = decode_packet_from_audio(audio, self.sr, strict=self.strict)
 
             # Jeśli nie udało się zdekodować — NAK + czekaj na retransmisję
-            if pkt is None or not pkt['crc_ok']:
+            if pkt is None or (not pkt['crc_ok'] and self.strict):
                 reason = "decode fail" if pkt is None else \
                     f"CRC FAIL (recv=0x{pkt['crc_received']:04X} " \
                     f"calc=0x{pkt['crc_computed']:04X})"
@@ -404,17 +412,31 @@ class LiveSession:
                 self.log(f"Czekam na retransmisje #{expected_seq}...")
                 audio = self._record_until_silence(timeout=PACKET_LISTEN_TIMEOUT)
                 if len(audio) == 0:
+                    # W lenient: jeśli mieliśmy pkt z bad CRC, dodaj go
+                    if not self.strict and pkt is not None:
+                        self.log(f"  [lenient] akceptuję PKT #{pkt['seq']} mimo CRC FAIL")
+                        received.append(pkt)
                     return self._try_reassemble(received)
 
-                pkt = decode_packet_from_audio(audio, self.sr)
-                if pkt is None or not pkt['crc_ok']:
+                pkt = decode_packet_from_audio(audio, self.sr, strict=self.strict)
+                if pkt is None or (not pkt['crc_ok'] and self.strict):
+                    if not self.strict and pkt is not None:
+                        self.log(f"  [lenient] akceptuję PKT #{pkt['seq']} mimo CRC FAIL")
+                        received.append(pkt)
+                        self._play(generate_ack_signal(self.sr))
+                        expected_seq = pkt['seq'] + 1
+                        if not pkt['more']:
+                            break
+                        time.sleep(0.15)
+                        continue
                     self.log("Retransmisja tez nieudana — NAK")
                     self._play(generate_nak_signal(self.sr))
                     return self._try_reassemble(received)
 
-            # ── CRC OK! ──
+            # ── Pakiet zaakceptowany ──
+            crc_str = "CRC OK" if pkt['crc_ok'] else "CRC FAIL (lenient)"
             self.log(f"PKT #{pkt['seq']} ({pkt['payload_len']}B) "
-                     f"CRC OK (0x{pkt['crc_received']:04X}) -> ACK")
+                     f"{crc_str} (0x{pkt['crc_received']:04X}) -> ACK")
             received.append(pkt)
             expected_seq = pkt['seq'] + 1
 

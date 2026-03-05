@@ -273,11 +273,14 @@ def encode_request(method: int, path: str, body: bytes = b"",
     return _nibbles_to_audio(nibbles, sr)
 
 
-def decode_request(audio: np.ndarray, sr: int = SAMPLE_RATE) -> dict | None:
+def decode_request(audio: np.ndarray, sr: int = SAMPLE_RATE,
+                   strict: bool = True) -> dict | None:
     """
     Dekoduj żądanie HTTP z audio FSK.
 
     Zwraca dict z: method, method_name, path, body, crc_ok, ...
+    strict=False: best-effort — nie odrzuca przy złym frame_type,
+                  zwraca częściowe dane nawet przy błędach.
     """
     _, _, step = calc_steps(sr)
 
@@ -295,7 +298,9 @@ def decode_request(audio: np.ndarray, sr: int = SAMPLE_RATE) -> dict | None:
     pos += 2 * step
 
     if frame_type != FRAME_REQUEST:
-        return None
+        if strict:
+            return None
+        print(f"  [lenient] frame_type=0x{frame_type:X} (oczekiwano REQUEST=0x{FRAME_REQUEST:X}), kontynuuje...")
 
     # PATH_LEN (1 bajt)
     pl = decode_nibbles(audio, pos, 2, sr)
@@ -335,12 +340,17 @@ def decode_request(audio: np.ndarray, sr: int = SAMPLE_RATE) -> dict | None:
     frame.extend(body[:body_len])
     computed_crc = crc16(bytes(frame))
 
+    crc_ok = received_crc == computed_crc
+    if not crc_ok and not strict:
+        print(f"  [lenient] CRC FAIL request (recv=0x{received_crc:04X} "
+              f"calc=0x{computed_crc:04X}), zwracam dane best-effort")
+
     return {
         "method": method,
         "method_name": METHOD_NAMES.get(method, "UNKNOWN"),
         "path": path,
         "body": body[:body_len],
-        "crc_ok": received_crc == computed_crc,
+        "crc_ok": crc_ok,
         "crc_received": received_crc,
         "crc_computed": computed_crc,
     }
@@ -377,11 +387,13 @@ def encode_response(status_compact: int, body: bytes,
     return _nibbles_to_audio(nibbles, sr)
 
 
-def decode_response(audio: np.ndarray, sr: int = SAMPLE_RATE) -> dict | None:
+def decode_response(audio: np.ndarray, sr: int = SAMPLE_RATE,
+                    strict: bool = True) -> dict | None:
     """
     Dekoduj odpowiedź HTTP z audio FSK.
 
     Zwraca dict z: status_compact, http_code, status_text, body, crc_ok, ...
+    strict=False: best-effort — nie odrzuca przy złym frame_type.
     """
     _, _, step = calc_steps(sr)
 
@@ -399,7 +411,9 @@ def decode_response(audio: np.ndarray, sr: int = SAMPLE_RATE) -> dict | None:
     pos += 2 * step
 
     if frame_type != FRAME_RESPONSE:
-        return None
+        if strict:
+            return None
+        print(f"  [lenient] frame_type=0x{frame_type:X} (oczekiwano RESPONSE=0x{FRAME_RESPONSE:X}), kontynuuje...")
 
     # BODY_LEN (2 bajty = 4 nibble)
     bl = decode_nibbles(audio, pos, 4, sr)
@@ -427,12 +441,17 @@ def decode_response(audio: np.ndarray, sr: int = SAMPLE_RATE) -> dict | None:
 
     http_code, status_text = compact_to_http(status_compact)
 
+    crc_ok = received_crc == computed_crc
+    if not crc_ok and not strict:
+        print(f"  [lenient] CRC FAIL response (recv=0x{received_crc:04X} "
+              f"calc=0x{computed_crc:04X}), zwracam dane best-effort")
+
     return {
         "status_compact": status_compact,
         "http_code": http_code,
         "status_text": status_text,
         "body": body[:body_len],
-        "crc_ok": received_crc == computed_crc,
+        "crc_ok": crc_ok,
         "crc_received": received_crc,
         "crc_computed": computed_crc,
     }
@@ -467,30 +486,67 @@ def build_response_frame(status_compact: int, body: bytes) -> bytes:
     return bytes(frame)
 
 
-def parse_request_frame(data: bytes) -> dict | None:
-    """Parsuj ramkę HTTP request z bajtów."""
+def parse_request_frame(data: bytes, strict: bool = True) -> dict | None:
+    """Parsuj ramkę HTTP request z bajtów.
+    strict=False: best-effort — próbuje wyciągnać co się da."""
     if len(data) < 6:  # min: TYPE+METHOD(1) + PATH_LEN(1) + BODY_LEN(2) + CRC(2)
-        return None
+        if strict:
+            return None
+        # w lenient spróbuj gołą dekodację
+        if len(data) < 2:
+            return None
     try:
         pos = 0
         tm_byte = data[pos]; pos += 1
         frame_type = (tm_byte >> 4) & 0xF
         method = tm_byte & 0xF
         if frame_type != FRAME_REQUEST:
-            return None
+            if strict:
+                return None
+            print(f"  [lenient] parse_request: frame_type=0x{frame_type:X}, kontynuuje...")
 
         path_len = data[pos]; pos += 1
         if pos + path_len + 4 > len(data):
-            return None
+            if strict:
+                return None
+            # lenient: obetnij path do dostępnych danych
+            available = len(data) - pos
+            path_len = min(path_len, max(0, available - 4))
+            print(f"  [lenient] obcięto path_len do {path_len}")
 
         path_bytes = data[pos:pos + path_len]; pos += path_len
         path = path_bytes.decode("utf-8", errors="replace")
 
+        # BODY_LEN
+        if pos + 2 > len(data):
+            if strict:
+                return None
+            return {
+                "method": method,
+                "method_name": METHOD_NAMES.get(method, "UNKNOWN"),
+                "path": path,
+                "body": b"",
+                "crc_ok": False,
+                "crc_received": 0, "crc_computed": 0,
+            }
+
         body_len = struct.unpack(">H", data[pos:pos + 2])[0]; pos += 2
         body = data[pos:pos + body_len]; pos += body_len
 
+        # CRC
         if pos + 2 > len(data):
-            return None
+            if strict:
+                return None
+            print(f"  [lenient] brak CRC, zwracam best-effort")
+            return {
+                "method": method,
+                "method_name": METHOD_NAMES.get(method, "UNKNOWN"),
+                "path": path,
+                "body": body[:body_len],
+                "crc_ok": False,
+                "crc_received": 0, "crc_computed": 0,
+            }
+
         received_crc = struct.unpack(">H", data[pos:pos + 2])[0]
 
         frame_for_crc = bytearray()
@@ -510,27 +566,58 @@ def parse_request_frame(data: bytes) -> dict | None:
             "crc_received": received_crc,
             "crc_computed": computed_crc,
         }
-    except Exception:
+    except Exception as e:
+        if not strict:
+            print(f"  [lenient] parse_request exception: {e}")
         return None
 
 
-def parse_response_frame(data: bytes) -> dict | None:
-    """Parsuj ramkę HTTP response z bajtów."""
+def parse_response_frame(data: bytes, strict: bool = True) -> dict | None:
+    """Parsuj ramkę HTTP response z bajtów.
+    strict=False: best-effort — próbuje wyciągnać co się da."""
     if len(data) < 5:  # min: TYPE+STATUS(1) + BODY_LEN(2) + CRC(2)
-        return None
+        if strict:
+            return None
+        if len(data) < 1:
+            return None
     try:
         pos = 0
         ts_byte = data[pos]; pos += 1
         frame_type = (ts_byte >> 4) & 0xF
         status_compact = ts_byte & 0xF
         if frame_type != FRAME_RESPONSE:
-            return None
+            if strict:
+                return None
+            print(f"  [lenient] parse_response: frame_type=0x{frame_type:X}, kontynuuje...")
+
+        # BODY_LEN
+        if pos + 2 > len(data):
+            if strict:
+                return None
+            http_code, status_text = compact_to_http(status_compact)
+            return {
+                "status_compact": status_compact,
+                "http_code": http_code, "status_text": status_text,
+                "body": b"", "crc_ok": False,
+                "crc_received": 0, "crc_computed": 0,
+            }
 
         body_len = struct.unpack(">H", data[pos:pos + 2])[0]; pos += 2
         body = data[pos:pos + body_len]; pos += body_len
 
+        # CRC
         if pos + 2 > len(data):
-            return None
+            if strict:
+                return None
+            http_code, status_text = compact_to_http(status_compact)
+            print(f"  [lenient] brak CRC, zwracam best-effort")
+            return {
+                "status_compact": status_compact,
+                "http_code": http_code, "status_text": status_text,
+                "body": body[:body_len], "crc_ok": False,
+                "crc_received": 0, "crc_computed": 0,
+            }
+
         received_crc = struct.unpack(">H", data[pos:pos + 2])[0]
 
         frame_for_crc = bytearray()
@@ -550,7 +637,9 @@ def parse_response_frame(data: bytes) -> dict | None:
             "crc_received": received_crc,
             "crc_computed": computed_crc,
         }
-    except Exception:
+    except Exception as e:
+        if not strict:
+            print(f"  [lenient] parse_response exception: {e}")
         return None
 
 

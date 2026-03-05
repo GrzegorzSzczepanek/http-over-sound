@@ -16,6 +16,9 @@ from protocol import METHOD_GET, METHOD_POST, http_to_compact
 import json
 
 
+import numpy as np
+
+
 def test_get_ping():
     print("Test 1: GET /ping (legacy audio)")
     audio = encode_request(METHOD_GET, "/ping")
@@ -205,6 +208,94 @@ def test_large_body_packets():
     print("  PASS\n")
 
 
+# ══════════════════════════════════════════════════════════════════════
+#  TESTY LENIENT MODE (best-effort)
+# ══════════════════════════════════════════════════════════════════════
+
+def test_lenient_corrupted_audio():
+    """Flip kilka nibble'i w audio i sprawdź, że lenient nadal zwraca dane."""
+    print("Test 12: Lenient — corrupted audio (CRC FAIL → best-effort)")
+
+    # Encode poprawny request
+    audio = encode_request(METHOD_GET, "/ping")
+
+    # Corrupt: dodaj szum w środku transmisji
+    mid = len(audio) // 2
+    noise = np.random.normal(0, 0.3, 1000)
+    audio[mid:mid + 1000] += noise
+
+    # Strict: może zwrócić dane, ale CRC fail
+    result_strict = decode_request(audio, strict=True)
+
+    # Lenient: powinien ZAWSZE zwrócić co się da
+    result_lenient = decode_request(audio, strict=False)
+    assert result_lenient is not None, "lenient decode returned None (should try best-effort)"
+    print(f"  strict: {'got data' if result_strict else 'None'}  "
+          f"crc={result_strict['crc_ok'] if result_strict else 'N/A'}")
+    print(f"  lenient: path={result_lenient['path']!r}  "
+          f"method={result_lenient['method_name']}  crc={result_lenient['crc_ok']}")
+    print("  PASS\n")
+
+
+def test_lenient_corrupted_frame():
+    """Uszkodz bajty w ramce i sprawdź, że lenient wyciąga częściowe dane."""
+    print("Test 13: Lenient — corrupted frame bytes (parse_request_frame)")
+
+    frame = build_request_frame(METHOD_POST, "/echo",
+                                json.dumps({"key": "val"}).encode())
+
+    # Corrupt last 2 bytes (CRC)
+    corrupted = bytearray(frame)
+    corrupted[-1] ^= 0xFF
+    corrupted[-2] ^= 0xFF
+    corrupted = bytes(corrupted)
+
+    # Strict: zwróci dane z crc_ok=False
+    result_strict = parse_request_frame(corrupted, strict=True)
+    assert result_strict is not None, "strict should still parse (valid structure)"
+    assert not result_strict["crc_ok"], "CRC should fail"
+
+    # Lenient: też zwróci dane
+    result_lenient = parse_request_frame(corrupted, strict=False)
+    assert result_lenient is not None
+    assert not result_lenient["crc_ok"]
+    assert result_lenient["path"] == "/echo"
+    assert b"key" in result_lenient["body"]
+    print(f"  strict:  path={result_strict['path']!r} crc={result_strict['crc_ok']}")
+    print(f"  lenient: path={result_lenient['path']!r} crc={result_lenient['crc_ok']}")
+
+    # Teraz obetnij ramkę (brak CRC na końcu)
+    truncated = frame[:-2]  # brak CRC
+    result_strict2 = parse_request_frame(truncated, strict=True)
+    result_lenient2 = parse_request_frame(truncated, strict=False)
+    assert result_strict2 is None, "strict should reject truncated frame"
+    assert result_lenient2 is not None, "lenient should extract partial data"
+    assert result_lenient2["path"] == "/echo"
+    print(f"  truncated frame: strict=None  lenient=path={result_lenient2['path']!r}")
+    print("  PASS\n")
+
+
+def test_lenient_server_roundtrip():
+    """Server w trybie lenient przetwarza request z uszkodzonym CRC."""
+    print("Test 14: Lenient — server round-trip with corrupted request")
+    from server import SoundRouter, setup_default_routes, SoundHTTPServer
+
+    router = SoundRouter()
+    setup_default_routes(router)
+    server = SoundHTTPServer(router, strict=False)
+
+    # Poprawny request → odpowiedź
+    req_audio = encode_request(METHOD_GET, "/ping")
+    resp_audio = server.process_audio(req_audio, SAMPLE_RATE)
+    assert resp_audio is not None, "Server returned None for valid request"
+
+    resp = decode_response(resp_audio, strict=False)
+    assert resp is not None
+    assert resp["http_code"] == 200
+    print(f"  lenient server: {resp['http_code']} {resp['status_text']} crc={resp['crc_ok']}")
+    print("  PASS\n")
+
+
 if __name__ == "__main__":
     print("\n  SoundHTTP Round-Trip Tests")
     print("  " + "=" * 40 + "\n")
@@ -224,4 +315,9 @@ if __name__ == "__main__":
     test_ack_nak_signals()
     test_large_body_packets()
 
-    print("  ALL 11 TESTS PASSED!\n")
+    # Lenient mode tests
+    test_lenient_corrupted_audio()
+    test_lenient_corrupted_frame()
+    test_lenient_server_roundtrip()
+
+    print("  ALL 14 TESTS PASSED!\n")

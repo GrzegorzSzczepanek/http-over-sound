@@ -57,10 +57,12 @@ class SoundHTTPClient:
 
     def __init__(self, speaker_index: int | None = None,
                  mic_index: int | None = None,
-                 sr: int = SAMPLE_RATE):
+                 sr: int = SAMPLE_RATE,
+                 strict: bool = True):
         self.speaker_index = speaker_index
         self.mic_index = mic_index
         self.sr = sr
+        self.strict = strict
 
     def log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -90,7 +92,8 @@ class SoundHTTPClient:
         # Otwórz sesję pakietową
         pa = pyaudio.PyAudio()
         session = LiveSession(pa, self.sr, self.mic_index,
-                              self.speaker_index, self.log)
+                              self.speaker_index, self.log,
+                              strict=self.strict)
 
         # Wyślij request jako pakiety
         self.log("Wysylam request pakietami...")
@@ -113,7 +116,7 @@ class SoundHTTPClient:
             return None
 
         # Parsuj ramkę response
-        response = parse_response_frame(response_data)
+        response = parse_response_frame(response_data, strict=self.strict)
         if response is None:
             self.log("[x] Nie udalo sie sparsowac odpowiedzi")
             return None
@@ -202,7 +205,7 @@ class SoundHTTPClient:
         audio = np.concatenate(collected)
         self.log(f"Zebrano {len(audio)/sr:.1f}s audio. Dekoduje...")
 
-        response = decode_response(audio, sr)
+        response = decode_response(audio, sr, strict=self.strict)
         if response is None:
             self.log("[x] Nie udalo sie zdekodowac odpowiedzi")
             return None
@@ -252,7 +255,7 @@ class SoundHTTPClient:
         audio, sr = read_wav(wav_path)
         self.log(f"Wczytano: {wav_path} ({len(audio)/sr:.2f}s)")
 
-        response = decode_response(audio, sr)
+        response = decode_response(audio, sr, strict=self.strict)
         if response is None:
             self.log("[x] Nie udalo sie zdekodowac odpowiedzi")
             return None
@@ -361,6 +364,8 @@ Przyklad:
                         help="Sample rate (domyslnie: 44100)")
     parser.add_argument("--list-devices", action="store_true",
                         help="Pokaz urzadzenia audio")
+    parser.add_argument("--lenient", action="store_true",
+                        help="Tryb lenient (best-effort): akceptuj dane mimo bledow CRC")
 
     args = parser.parse_args()
 
@@ -372,6 +377,7 @@ Przyklad:
         speaker_index=args.speaker,
         mic_index=args.mic,
         sr=args.sr,
+        strict=not getattr(args, 'lenient', False),
     )
 
     # Decode response mode

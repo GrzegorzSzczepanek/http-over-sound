@@ -171,11 +171,13 @@ def setup_default_routes(router: SoundRouter):
 
 class SoundHTTPServer:
 
-    def __init__(self, router: SoundRouter | None = None, debug: bool = False):
+    def __init__(self, router: SoundRouter | None = None, debug: bool = False,
+                 strict: bool = True):
         self.router = router or SoundRouter()
         self.running = False
         self.request_count = 0
         self.debug = debug
+        self.strict = strict
 
     def log(self, msg: str):
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -185,7 +187,7 @@ class SoundHTTPServer:
         """Dekoduj żądanie z audio, przetwórz przez router, zwróć audio odpowiedzi."""
         self.log("Dekodowanie zadania...")
 
-        request = decode_request(audio, sr)
+        request = decode_request(audio, sr, strict=self.strict)
         if request is None:
             self.log("[x] Nie udalo sie zdekodowac zadania")
             return None
@@ -269,6 +271,8 @@ class SoundHTTPServer:
         print(f"  |  Glosnik  : {spk_name:<37}|")
         print(f"  |  SR       : {sr:<37}|")
         print(f"  |  Pakiety  : 32B/pkt, ACK/NAK, retransmisja     |")
+        if not self.strict:
+            print(f"  |  Tryb     : LENIENT (best-effort)               |")
         print(f"  +{'=' * 50}+")
         print(f"  Nasluchuje... (Ctrl+C aby zatrzymac)\n")
 
@@ -385,11 +389,12 @@ class SoundHTTPServer:
                 stream.close()
                 self.log("Tryb pakietowy: odbieranie requestu...")
 
-                session = LiveSession(pa, sr, mic_index, speaker_index, self.log)
+                session = LiveSession(pa, sr, mic_index, speaker_index,
+                                      self.log, strict=self.strict)
                 request_data = session.receive_data(first_audio=full_audio)
 
                 if request_data is not None:
-                    request = parse_request_frame(request_data)
+                    request = parse_request_frame(request_data, strict=self.strict)
 
                     if request is not None:
                         self.request_count += 1
@@ -480,6 +485,8 @@ Przyklad:
                         help="Pokaz urzadzenia audio")
     parser.add_argument("--debug", action="store_true",
                         help="Wyswietlaj diagnostyke (poziom mikrofonu, detekcja)")
+    parser.add_argument("--lenient", action="store_true",
+                        help="Tryb lenient (best-effort): akceptuj dane mimo bledow CRC")
 
     args = parser.parse_args()
 
@@ -489,7 +496,8 @@ Przyklad:
 
     router = SoundRouter()
     setup_default_routes(router)
-    server = SoundHTTPServer(router, debug=getattr(args, 'debug', False))
+    server = SoundHTTPServer(router, debug=getattr(args, 'debug', False),
+                             strict=not getattr(args, 'lenient', False))
 
     if args.simulate:
         server.serve_simulate(args.simulate, args.response_wav)
