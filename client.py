@@ -43,7 +43,9 @@ from modem import (
     play_audio, record_audio, list_audio_devices,
     estimate_request_duration, estimate_response_duration,
     BYTES_PER_SEC,
+    build_request_frame, parse_response_frame,
 )
+from packets import LiveSession
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -64,42 +66,76 @@ class SoundHTTPClient:
         ts = datetime.now().strftime("%H:%M:%S.%f")[:-3]
         print(f"  [{ts}] {msg}")
 
-    # ── Wysyłanie żądania ──
+    # ── Wysyłanie żądania (packet mode) ──
 
     def send_request(self, method_name: str, path: str,
                      body: bytes = b"") -> dict | None:
         """
-        Wyślij żądanie przez głośnik i nasłuchuj odpowiedzi na mikrofonie.
-        Zwraca zdekodowaną odpowiedź lub None.
+        Wyślij żądanie przez głośnik jako pakiety z ACK/NAK
+        i nasłuchuj odpowiedzi pakietowej na mikrofonie.
         """
+        from protocol import METHOD_FROM_NAME
+        import pyaudio
+
         method = METHOD_FROM_NAME.get(method_name.upper())
         if method is None:
             print(f"  [x] Nieznana metoda: {method_name}")
             return None
 
-        # Enkoduj żądanie
+        # Zbuduj ramkę request
+        request_frame = build_request_frame(method, path, body)
         body_info = f"  body={len(body)}B" if body else ""
-        self.log(f"--> {method_name} {path}{body_info}")
+        self.log(f"--> {method_name} {path}{body_info} ({len(request_frame)}B frame)")
 
-        request_audio = encode_request(method, path, body, self.sr)
-        req_duration = len(request_audio) / self.sr
+        # Otwórz sesję pakietową
+        pa = pyaudio.PyAudio()
+        session = LiveSession(pa, self.sr, self.mic_index,
+                              self.speaker_index, self.log)
 
-        # Odtwórz przez głośnik
-        self.log(f"Odtwarzam request ({req_duration:.1f}s)...")
-        play_audio(request_audio, self.sr, self.speaker_index)
-        self.log("Request wyslany!")
+        # Wyślij request jako pakiety
+        self.log("Wysylam request pakietami...")
+        success = session.send_data(request_frame)
 
-        # Nasłuchuj odpowiedzi
-        self.log("Nasluchuje odpowiedzi...")
+        if not success:
+            self.log("[x] Nie udalo sie wyslac requestu")
+            pa.terminate()
+            return None
 
-        # Odczekaj chwilę na przetwarzanie po stronie serwera
+        self.log("Request wyslany. Czekam na odpowiedz...")
         time.sleep(0.5)
 
-        response = self._listen_for_response()
+        # Odbierz odpowiedź jako pakiety
+        response_data = session.receive_data()
+        pa.terminate()
+
+        if response_data is None:
+            self.log("[x] Nie odebrano odpowiedzi")
+            return None
+
+        # Parsuj ramkę response
+        response = parse_response_frame(response_data)
+        if response is None:
+            self.log("[x] Nie udalo sie sparsowac odpowiedzi")
+            return None
+
+        crc = "CRC OK" if response["crc_ok"] else "CRC FAIL"
+        self.log(f"<-- {response['http_code']} {response['status_text']}  [{crc}]")
+
+        if response["body"]:
+            try:
+                body_text = response["body"].decode("utf-8")
+                try:
+                    body_json = json.loads(body_text)
+                    print(f"\n  {json.dumps(body_json, indent=2, ensure_ascii=False)}\n")
+                except json.JSONDecodeError:
+                    print(f"\n  {body_text}\n")
+            except UnicodeDecodeError:
+                print(f"\n  <{len(response['body'])}B binary>\n")
+
         return response
 
     def _listen_for_response(self, timeout: float = 20.0) -> dict | None:
-        """Nasłuchuj na mikrofonie i zdekoduj odpowiedź FSK."""
+        """Nasłuchuj na mikrofonie i zdekoduj odpowiedź FSK (legacy, non-packet)."""
         try:
             import pyaudio
         except ImportError:

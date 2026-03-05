@@ -37,7 +37,9 @@ from modem import (
     calc_steps, find_preamble, decode_request, encode_response,
     write_wav, read_wav, play_audio, list_audio_devices,
     detect_nibble, estimate_response_duration,
+    build_response_frame, parse_request_frame,
 )
+from packets import LiveSession
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -235,13 +237,14 @@ class SoundHTTPServer:
             return out
         return None
 
-    # ── Tryb live ──
+    # ── Tryb live (packet protocol) ──
 
     def serve_live(self, mic_index: int | None = None,
                    speaker_index: int | None = None,
                    sr: int = SAMPLE_RATE):
         """
-        Nasłuchuj na mikrofonie, dekoduj żądania, odpowiadaj przez głośnik.
+        Nasłuchuj na mikrofonie, dekoduj żądania jako pakiety z ACK/NAK,
+        odpowiadaj pakietami przez głośnik.
         """
         try:
             import pyaudio
@@ -260,35 +263,35 @@ class SoundHTTPServer:
             spk_name = pa.get_device_info_by_index(speaker_index)["name"]
 
         print(f"\n  +{'=' * 50}+")
-        print(f"  |  SoundHTTP Server  [live mode]                 |")
+        print(f"  |  SoundHTTP Server  [live / packet mode]         |")
         print(f"  +{'=' * 50}+")
         print(f"  |  Mikrofon : {mic_name:<37}|")
         print(f"  |  Glosnik  : {spk_name:<37}|")
         print(f"  |  SR       : {sr:<37}|")
+        print(f"  |  Pakiety  : 32B/pkt, ACK/NAK, retransmisja     |")
         print(f"  +{'=' * 50}+")
         print(f"  Nasluchuje... (Ctrl+C aby zatrzymac)\n")
 
         CHUNK = int(sr * 0.05)  # 50ms chunki
         BUFFER_SEC = 30
         buffer_size = int(sr * BUFFER_SEC)
+        RMS_THRESHOLD = 0.003
+        AVG_THRESHOLD = 0.004
 
-        stream = pa.open(
-            format=pyaudio.paInt16,
-            channels=1,
-            rate=sr,
-            input=True,
-            input_device_index=mic_index,
-            frames_per_buffer=CHUNK,
-        )
+        def open_mic_stream():
+            return pa.open(
+                format=pyaudio.paInt16, channels=1, rate=sr,
+                input=True, input_device_index=mic_index,
+                frames_per_buffer=CHUNK,
+            )
 
+        stream = open_mic_stream()
         audio_buffer = np.zeros(buffer_size, dtype=np.float64)
         write_pos = 0
         last_request_time = 0
         COOLDOWN = 3.0
         energy_history = []
         ENERGY_WINDOW = 20
-        RMS_THRESHOLD = 0.003       # próg energii chunka (był 0.008)
-        AVG_THRESHOLD = 0.004       # próg średniej energii (był 0.01)
         debug_counter = 0
 
         if self.debug:
@@ -357,14 +360,14 @@ class SoundHTTPServer:
                     continue
 
                 last_request_time = now
-                self.log("Preambula wykryta! Czekam na pelne zadanie...")
+                self.log("Preambula wykryta! Zbieram pierwszy pakiet...")
 
-                # Poczekaj na resztę transmisji
+                # Poczekaj na resztę pierwszego pakietu
                 time.sleep(2.5)
 
                 # Dozbieraj dane
                 extra_chunks = []
-                for _ in range(int(sr * 1.5 / CHUNK)):
+                for _ in range(int(sr * 2.0 / CHUNK)):
                     try:
                         extra_raw = stream.read(CHUNK, exception_on_overflow=False)
                         extra_chunks.append(
@@ -378,35 +381,69 @@ class SoundHTTPServer:
                 else:
                     full_audio = segment
 
-                response_audio = self.process_audio(full_audio, sr)
+                # === Przełącz na tryb pakietowy ===
+                stream.close()
+                self.log("Tryb pakietowy: odbieranie requestu...")
 
-                if response_audio is not None:
-                    self.log("Odtwarzam odpowiedz przez glosnik...")
-                    time.sleep(0.5)
+                session = LiveSession(pa, sr, mic_index, speaker_index, self.log)
+                request_data = session.receive_data(first_audio=full_audio)
 
-                    out_stream = pa.open(
-                        format=pyaudio.paInt16,
-                        channels=1,
-                        rate=sr,
-                        output=True,
-                        output_device_index=speaker_index,
-                    )
-                    out_data = np.clip(
-                        response_audio * 32767, -32768, 32767
-                    ).astype(np.int16)
-                    out_stream.write(out_data.tobytes())
-                    out_stream.close()
+                if request_data is not None:
+                    request = parse_request_frame(request_data)
 
-                    dur = len(response_audio) / sr
-                    self.log(f"Odpowiedz wyslana ({dur:.1f}s)")
-                    last_request_time = time.time()
+                    if request is not None:
+                        self.request_count += 1
+                        crc = "CRC OK" if request["crc_ok"] else "CRC FAIL"
+                        method_name = request["method_name"]
+                        path = request["path"]
+
+                        body_info = ""
+                        if request["body"]:
+                            try:
+                                body_info = f'  body="{request["body"].decode("utf-8")[:80]}"'
+                            except UnicodeDecodeError:
+                                body_info = f"  body=<{len(request['body'])}B>"
+
+                        self.log(f"<-- #{self.request_count} {method_name} {path}{body_info}  [{crc}]")
+
+                        status_compact, response_body = self.router.handle(
+                            request["method"], request["path"], request["body"]
+                        )
+                        http_code, status_text = compact_to_http(status_compact)
+                        self.log(f"--> {http_code} {status_text} ({len(response_body)}B)")
+
+                        try:
+                            preview = response_body.decode("utf-8")[:120]
+                            self.log(f"    {preview}")
+                        except UnicodeDecodeError:
+                            pass
+
+                        # Wyslij odpowiedz jako pakiety
+                        response_frame = build_response_frame(
+                            status_compact, response_body
+                        )
+                        time.sleep(0.5)
+                        self.log("Wysylanie odpowiedzi pakietami...")
+                        session.send_data(response_frame)
+                    else:
+                        self.log("Nie udalo sie sparsowac requestu z pakietow")
                 else:
-                    self.log("Nie udalo sie zdekodowac — czekam dalej...")
+                    self.log("Nie udalo sie odebrac pakietow -- czekam dalej...")
+
+                # === Powrót do głównej pętli nasłuchowej ===
+                last_request_time = time.time()
+                stream = open_mic_stream()
+                audio_buffer = np.zeros(buffer_size, dtype=np.float64)
+                write_pos = 0
+                energy_history = []
 
         except KeyboardInterrupt:
             print(f"\n\n  Server zatrzymany. Obsluzono {self.request_count} zadan.\n")
         finally:
-            stream.close()
+            try:
+                stream.close()
+            except Exception:
+                pass
             pa.terminate()
 
 

@@ -172,16 +172,17 @@ def _nibbles_to_audio(nibbles: list[int], sr: int = SAMPLE_RATE) -> np.ndarray:
 # ══════════════════════════════════════════════════════════════════════
 
 def detect_nibble(segment: np.ndarray, sr: int = SAMPLE_RATE) -> tuple[int, float]:
-    """Wykryj nibble z segmentu audio (FFT peak detection)."""
+    """Wykryj nibble z segmentu audio (zero-padded FFT, energy-based)."""
     windowed = segment * np.hanning(len(segment))
-    fft_mag = np.abs(np.fft.rfft(windowed))
-    freqs = np.fft.rfftfreq(len(windowed), 1.0 / sr)
+    nfft = max(len(windowed), 8192)  # zero-pad dla lepszej rozdzielczości
+    fft_mag = np.abs(np.fft.rfft(windowed, n=nfft))
+    freqs = np.fft.rfftfreq(nfft, 1.0 / sr)
     energies = np.zeros(16)
-    bw = FREQ_STEP * 0.4
+    bw = FREQ_STEP * 0.35
     for i, tf in enumerate(FREQS):
         mask = (freqs >= tf - bw) & (freqs <= tf + bw)
         if mask.any():
-            energies[i] = np.max(fft_mag[mask])
+            energies[i] = np.sum(fft_mag[mask] ** 2)  # energia zamiast max
     best = np.argmax(energies)
     total = energies.sum()
     conf = energies[best] / total if total > 0 else 0
@@ -214,7 +215,7 @@ def find_preamble(audio: np.ndarray, sr: int = SAMPLE_RATE) -> int | None:
                 conf_sum += c
 
         score = match + conf_sum * 0.1
-        if match == len(PREAMBLE) and score > best_score:
+        if match >= len(PREAMBLE) - 1 and score > best_score:
             best_score = score
             best_off = off
         off += scan
@@ -435,6 +436,122 @@ def decode_response(audio: np.ndarray, sr: int = SAMPLE_RATE) -> dict | None:
         "crc_received": received_crc,
         "crc_computed": computed_crc,
     }
+
+
+# ══════════════════════════════════════════════════════════════════════
+#  BUDOWANIE / PARSOWANIE RAMEK (bajty, bez audio)
+# ══════════════════════════════════════════════════════════════════════
+
+def build_request_frame(method: int, path: str, body: bytes = b"") -> bytes:
+    """Zbuduj ramkę HTTP request jako bajty (bez kodowania FSK)."""
+    path_bytes = path.encode("utf-8")
+    frame = bytearray()
+    frame.append((FRAME_REQUEST << 4) | (method & 0xF))
+    frame.append(len(path_bytes))
+    frame.extend(path_bytes)
+    frame.extend(struct.pack(">H", len(body)))
+    frame.extend(body)
+    checksum = crc16(bytes(frame))
+    frame.extend(struct.pack(">H", checksum))
+    return bytes(frame)
+
+
+def build_response_frame(status_compact: int, body: bytes) -> bytes:
+    """Zbuduj ramkę HTTP response jako bajty (bez kodowania FSK)."""
+    frame = bytearray()
+    frame.append((FRAME_RESPONSE << 4) | (status_compact & 0xF))
+    frame.extend(struct.pack(">H", len(body)))
+    frame.extend(body)
+    checksum = crc16(bytes(frame))
+    frame.extend(struct.pack(">H", checksum))
+    return bytes(frame)
+
+
+def parse_request_frame(data: bytes) -> dict | None:
+    """Parsuj ramkę HTTP request z bajtów."""
+    if len(data) < 6:  # min: TYPE+METHOD(1) + PATH_LEN(1) + BODY_LEN(2) + CRC(2)
+        return None
+    try:
+        pos = 0
+        tm_byte = data[pos]; pos += 1
+        frame_type = (tm_byte >> 4) & 0xF
+        method = tm_byte & 0xF
+        if frame_type != FRAME_REQUEST:
+            return None
+
+        path_len = data[pos]; pos += 1
+        if pos + path_len + 4 > len(data):
+            return None
+
+        path_bytes = data[pos:pos + path_len]; pos += path_len
+        path = path_bytes.decode("utf-8", errors="replace")
+
+        body_len = struct.unpack(">H", data[pos:pos + 2])[0]; pos += 2
+        body = data[pos:pos + body_len]; pos += body_len
+
+        if pos + 2 > len(data):
+            return None
+        received_crc = struct.unpack(">H", data[pos:pos + 2])[0]
+
+        frame_for_crc = bytearray()
+        frame_for_crc.append(tm_byte)
+        frame_for_crc.append(path_len)
+        frame_for_crc.extend(path_bytes[:path_len])
+        frame_for_crc.extend(struct.pack(">H", body_len))
+        frame_for_crc.extend(body[:body_len])
+        computed_crc = crc16(bytes(frame_for_crc))
+
+        return {
+            "method": method,
+            "method_name": METHOD_NAMES.get(method, "UNKNOWN"),
+            "path": path,
+            "body": body[:body_len],
+            "crc_ok": received_crc == computed_crc,
+            "crc_received": received_crc,
+            "crc_computed": computed_crc,
+        }
+    except Exception:
+        return None
+
+
+def parse_response_frame(data: bytes) -> dict | None:
+    """Parsuj ramkę HTTP response z bajtów."""
+    if len(data) < 5:  # min: TYPE+STATUS(1) + BODY_LEN(2) + CRC(2)
+        return None
+    try:
+        pos = 0
+        ts_byte = data[pos]; pos += 1
+        frame_type = (ts_byte >> 4) & 0xF
+        status_compact = ts_byte & 0xF
+        if frame_type != FRAME_RESPONSE:
+            return None
+
+        body_len = struct.unpack(">H", data[pos:pos + 2])[0]; pos += 2
+        body = data[pos:pos + body_len]; pos += body_len
+
+        if pos + 2 > len(data):
+            return None
+        received_crc = struct.unpack(">H", data[pos:pos + 2])[0]
+
+        frame_for_crc = bytearray()
+        frame_for_crc.append(ts_byte)
+        frame_for_crc.extend(struct.pack(">H", body_len))
+        frame_for_crc.extend(body[:body_len])
+        computed_crc = crc16(bytes(frame_for_crc))
+
+        http_code, status_text = compact_to_http(status_compact)
+
+        return {
+            "status_compact": status_compact,
+            "http_code": http_code,
+            "status_text": status_text,
+            "body": body[:body_len],
+            "crc_ok": received_crc == computed_crc,
+            "crc_received": received_crc,
+            "crc_computed": computed_crc,
+        }
+    except Exception:
+        return None
 
 
 # ══════════════════════════════════════════════════════════════════════
